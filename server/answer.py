@@ -21,7 +21,7 @@ from router import classify, LABEL
 # 路径与 base_url / model 都来自 server/settings.py（环境变量 > config/settings.json > 默认值）。
 KEY_FILE = settings.api_key_path()
 RELAY_ENABLED = bool(settings.get('relay_enabled', False))
-DIRECT_BASE_URL = settings.get('base_url')
+DIRECT_BASE_URL = 'https://api.deepseek.com' if RELAY_ENABLED else settings.get('base_url')
 RELAY_BASE_URL = settings.get('relay_base_url')
 BASE_URL = RELAY_BASE_URL if RELAY_ENABLED else DIRECT_BASE_URL
 
@@ -47,15 +47,14 @@ except Exception:
 #   首字中位 546ms vs 694ms（tools/compare_model_id.py）。
 # 全项目统一走 flash，不用 pro（思考模型，首字 6690ms，面试场景用不上）。
 # 换模型：改 config/settings.json 的 llm_model，或设环境变量 TP_LLM_MODEL。
-DIRECT_MODEL = settings.get('llm_model')
-MODEL = settings.get('relay_model_fast') if RELAY_ENABLED else DIRECT_MODEL
-RELAY_KEY_REF = settings.get('relay_api_key_ref', 'TP_RELAY_API_KEY')
+DIRECT_MODEL = 'deepseek-chat' if RELAY_ENABLED else settings.get('llm_model')
+MODEL = settings.get('relay_model_' + settings.get('relay_tier', 'fast')) if RELAY_ENABLED else DIRECT_MODEL
 EXTRA_BODY = {'thinking': {'type': 'disabled'}}
 # 超时：SDK 默认 read timeout 是 600 秒、默认重试 2 次 —— 面试时网络一抖，
 # 屏幕上就永远停在半句话，不报错也不兜底。8 秒够用（正常首字 0.3~1.5s），重试 1 次，
 # 再失败就走题库兜底。
 ANSWER_TIMEOUT = float(os.environ.get('TP_TIMEOUT', '8'))
-ANSWER_RETRIES = int(os.environ.get('TP_RETRIES', '1'))
+ANSWER_RETRIES = int(os.environ.get('TP_RETRIES', '3'))
 # 首字看门狗：超过这个秒数还没吐第一个字，后端发一条 slow 事件，UI 提示"这题自己先讲"
 # 实测：题面组装（检索 + 题库 + 名词判定）+ 网络往返，正常也要 1.5~2.5 秒才出第一个字。
 # 阈值定 3 秒会在好网络下误报，定 5 秒才既能兜住真卡住、又不吓人。
@@ -1023,9 +1022,9 @@ def _client(timeout):
     global _CLIENT
     if _CLIENT is None or getattr(_CLIENT, '_tp_timeout', None) != timeout:
         from openai import OpenAI
-        api_key = (os.environ.get(RELAY_KEY_REF) or '').strip() if RELAY_ENABLED else load_key()
+        api_key = settings.relay_key() if RELAY_ENABLED else load_key()
         if not api_key:
-            api_key = load_key()
+            raise RuntimeError('Relay token is not configured')
         _CLIENT = OpenAI(api_key=api_key, base_url=BASE_URL,
                          timeout=timeout, max_retries=ANSWER_RETRIES)
         _CLIENT._tp_timeout = timeout
@@ -1061,9 +1060,9 @@ def answer_stream(question, on_delta=None, qtype=None, company=None, topk=DEFAUL
     也不会把上一题的答案混进下一题（那是"照念错内容"级别的错）。
     """
     msgs, qtype, hits = build_messages(question, qtype, company, topk, history)
-    client = _client(timeout)
     t0 = time.time(); first = None; buf = []
     try:
+        client = _client(timeout)
         stream = client.chat.completions.create(
             model=MODEL, messages=msgs, stream=True,
             temperature=0.2, max_tokens=400, extra_body=EXTRA_BODY)
@@ -1079,6 +1078,8 @@ def answer_stream(question, on_delta=None, qtype=None, company=None, topk=DEFAUL
                 buf.append(piece)
                 if on_delta:
                     on_delta(piece)
+        if not buf and not (should_stop and should_stop()):
+            raise RuntimeError('Relay returned no answer text')
     except Exception:
         if not RELAY_ENABLED or buf:
             raise

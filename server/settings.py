@@ -85,6 +85,7 @@ _DEFAULTS = {
     'relay_api_key_ref': 'TP_RELAY_API_KEY',
     'relay_model_fast': 'earshot-fast',
     'relay_model_smart': 'earshot-smart',
+    'relay_tier': 'fast',
     'corpus_globs': [os.path.join(REPO_ROOT, 'knowledge', '**', '*.md'),
                      os.path.join(REPO_ROOT, 'knowledge', '**', '*.txt')],
     # 资料包（空 = 老行为）。见文件头「corpus_profile」。
@@ -126,6 +127,7 @@ _ENV_KEYS = {
     'relay_api_key_ref': 'TP_RELAY_API_KEY_REF',
     'relay_model_fast': 'TP_RELAY_MODEL_FAST',
     'relay_model_smart': 'TP_RELAY_MODEL_SMART',
+    'relay_tier': 'TP_RELAY_TIER',
     'corpus_globs': 'TP_CORPUS_GLOBS',
     'corpus_profile': 'TP_CORPUS_PROFILE',
     'ports': 'TP_PORTS',
@@ -252,9 +254,12 @@ def load(reload=False):
     cfg['relay_model_smart'] = str(cfg.get('relay_model_smart') or '').strip() or _DEFAULTS['relay_model_smart']
     raw_enabled = cfg.get('relay_enabled', _DEFAULTS['relay_enabled'])
     cfg['relay_enabled'] = str(raw_enabled).strip().lower() not in ('0', 'false', 'no', 'off')
-    # Existing TP_BASE_URL users explicitly selected direct mode; do not route them
-    # through the new relay unless they opt in with a relay-specific variable.
-    if (os.environ.get('TP_BASE_URL') or '').strip() and not (os.environ.get('TP_RELAY_ENABLED') or '').strip():
+    if raw and 'relay_enabled' not in raw and not os.environ.get('TP_RELAY_ENABLED'):
+        cfg['relay_enabled'] = False
+    cfg['relay_tier'] = 'smart' if cfg.get('relay_tier') == 'smart' else 'fast'
+    # Existing TP_BASE_URL users explicitly selected direct mode. Remove that
+    # legacy variable before selecting a relay in the settings window.
+    if (os.environ.get('TP_BASE_URL') or '').strip():
         cfg['relay_enabled'] = False
 
     _CACHE = cfg
@@ -264,6 +269,65 @@ def load(reload=False):
 def get(key, default=None):
     """取一个配置项；没这个键就返回 default。"""
     return load().get(key, default)
+
+
+def _relay_secret_path():
+    import hashlib
+    ref = get('relay_api_key_ref', 'TP_RELAY_API_KEY')
+    name = hashlib.sha256(ref.encode('utf-8')).hexdigest() + '.bin'
+    return os.path.join(os.environ.get('LOCALAPPDATA', os.path.expanduser('~')),
+                        'EarShot', 'credentials', name)
+
+
+def _dpapi(data, decrypt=False):
+    import ctypes
+    from ctypes import wintypes
+
+    class Blob(ctypes.Structure):
+        _fields_ = [('size', wintypes.DWORD), ('data', ctypes.POINTER(ctypes.c_byte))]
+
+    if sys.platform != 'win32':
+        raise OSError('Relay credential storage requires Windows DPAPI')
+    buffer = ctypes.create_string_buffer(data)
+    source = Blob(len(data), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_byte)))
+    result = Blob()
+    if decrypt:
+        ok = ctypes.windll.crypt32.CryptUnprotectData(
+            ctypes.byref(source), None, None, None, None, 1, ctypes.byref(result))
+    else:
+        ok = ctypes.windll.crypt32.CryptProtectData(
+            ctypes.byref(source), 'EarShot relay', None, None, None, 1,
+            ctypes.byref(result))
+    if not ok:
+        raise ctypes.WinError()
+    try:
+        return ctypes.string_at(result.data, result.size)
+    finally:
+        ctypes.windll.kernel32.LocalFree(result.data)
+
+
+def relay_key():
+    value = (os.environ.get(get('relay_api_key_ref')) or '').strip()
+    if value:
+        return value
+    path = _relay_secret_path()
+    if not os.path.exists(path):
+        return ''
+    with open(path, 'rb') as f:
+        return _dpapi(f.read(), decrypt=True).decode('utf-8')
+
+
+def save_relay_key(value):
+    path = _relay_secret_path()
+    if not value:
+        if os.path.exists(path):
+            os.remove(path)
+        return
+    encrypted = _dpapi(value.strip().encode('utf-8'))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + '.tmp', 'wb') as f:
+        f.write(encrypted)
+    os.replace(path + '.tmp', path)
 
 
 def model_dir():
