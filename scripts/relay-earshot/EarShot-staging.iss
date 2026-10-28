@@ -1,7 +1,7 @@
 [Setup]
 AppId={{4AC4B6C2-E4B5-44D0-A652-000010282026}
 AppName=EarShot Relay Staging
-AppVersion=0.9.22
+AppVersion=0.9.23
 DefaultDirName={localappdata}\EarShotRelay-Staging
 DefaultGroupName=EarShot Relay Staging
 PrivilegesRequired=lowest
